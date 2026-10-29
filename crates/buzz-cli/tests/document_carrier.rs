@@ -20,9 +20,17 @@ const RELS: &[u8] = br#"<?xml version="1.0"?><Relationships xmlns="http://schema
 const DOCUMENT: &[u8] = br#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Original document</w:t></w:r></w:p></w:body></w:document>"#;
 
 fn package(parts: &[(&str, &[u8])]) -> Vec<u8> {
+    package_with_method(parts, zip::CompressionMethod::Deflated)
+}
+
+fn package_with_method(parts: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in parts {
-        zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+        zip.start_file(
+            *name,
+            SimpleFileOptions::default().compression_method(method),
+        )
+        .unwrap();
         zip.write_all(bytes).unwrap();
     }
     zip.finish().unwrap().into_inner()
@@ -566,8 +574,24 @@ async fn word_packages_bound_entries_metadata_and_declared_sizes_and_reject_dupl
     let footer = ambiguous[ambiguous.len() - 22..].to_vec();
     ambiguous.extend_from_slice(&footer);
     let mut zip64 = word_package();
-    let footer = zip64.split_off(zip64.len() - 22);
-    zip64.extend_from_slice(b"PK\x06\x07");
+    let mut footer = zip64.split_off(zip64.len() - 22);
+    let record_offset = zip64.len() as u64;
+    let directory_size = u32::from_le_bytes(footer[12..16].try_into().unwrap()) as u64;
+    let directory_offset = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as u64;
+    let mut record = vec![0u8; 56];
+    record[..4].copy_from_slice(b"PK\x06\x06");
+    record[4..12].copy_from_slice(&44u64.to_le_bytes());
+    record[24..32].copy_from_slice(&4u64.to_le_bytes());
+    record[32..40].copy_from_slice(&4u64.to_le_bytes());
+    record[40..48].copy_from_slice(&directory_size.to_le_bytes());
+    record[48..56].copy_from_slice(&directory_offset.to_le_bytes());
+    zip64.extend_from_slice(&record);
+    let mut locator = vec![0u8; 20];
+    locator[..4].copy_from_slice(b"PK\x06\x07");
+    locator[8..16].copy_from_slice(&record_offset.to_le_bytes());
+    locator[16..20].copy_from_slice(&1u32.to_le_bytes());
+    zip64.extend_from_slice(&locator);
+    footer[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
     zip64.extend_from_slice(&footer);
     let names: Vec<_> = (0..257).map(|i| format!("part{i}.xml")).collect();
     let parts: Vec<_> = names
@@ -625,5 +649,50 @@ async fn word_packages_bound_entries_metadata_and_declared_sizes_and_reject_dupl
         .await,
         0
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn word_with_stored_embedded_zip_and_footer_bytes_uploads_original_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embedded.docx");
+    let embedded = package_with_method(
+        &[("sheet.xml", b"<sheet/>")],
+        zip::CompressionMethod::Stored,
+    );
+    let content_types = String::from_utf8(CONTENT_TYPES.to_vec()).unwrap().replace(
+        "</Types>",
+        r#"<Default Extension="zip" ContentType="application/zip"/><Default Extension="bin" ContentType="application/octet-stream"/></Types>"#,
+    );
+    let original = package_with_method(
+        &[
+            ("custom.xml", b"<custom/>"),
+            ("[Content_Types].xml", content_types.as_bytes()),
+            ("_rels/.rels", RELS),
+            ("word/document.xml", DOCUMENT),
+            ("word/embeddings/source.zip", &embedded),
+            (
+                "word/media/binary.bin",
+                b"embedded binary PK\x06\x06 and PK\x06\x07 footer signatures",
+            ),
+        ],
+        zip::CompressionMethod::Stored,
+    );
+    assert_eq!(
+        original.windows(4).filter(|v| *v == b"PK\x05\x06").count(),
+        2
+    );
+    std::fs::write(&path, &original).unwrap();
+    let fixture = Arc::new(Fixture::default());
+    let (url, task) = relay(fixture.clone()).await;
+    let keys = Keys::generate();
+    assert_eq!(
+        cli(&url, &keys, &send("envelope\n", &[path], true)).await,
+        0
+    );
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_upload(&requests[0], &original, &keys);
+    assert_event(&requests[1], "envelope\n", &[original], &keys);
     task.abort();
 }

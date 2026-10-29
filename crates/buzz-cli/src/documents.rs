@@ -58,39 +58,18 @@ fn validate_word_package(bytes: &[u8]) -> Result<(), CliError> {
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         return Err(invalid_docx());
     }
-    // Bound the parser's entry allocation before opening the archive. This narrow
-    // carrier accepts single-disk, non-ZIP64 packages, sufficient for <=10 MiB DOCX.
-    // The parser may otherwise fall back to an older footer or prefer ZIP64,
-    // bypassing the allocation bound. Reject ambiguous footer layouts up front.
-    let mut ends = bytes
-        .windows(4)
-        .enumerate()
-        .filter(|(_, w)| *w == b"PK\x05\x06");
-    let end = ends.next().map(|(i, _)| i).ok_or_else(invalid_docx)?;
-    if ends.next().is_some()
-        || bytes
-            .windows(4)
-            .any(|w| matches!(w, b"PK\x06\x06" | b"PK\x06\x07"))
-    {
-        return Err(invalid_docx());
-    }
-    let eocd = bytes
-        .get(end..)
-        .filter(|v| v.len() >= 22)
-        .ok_or_else(invalid_docx)?;
-    let u16_at = |i| u16::from_le_bytes([eocd[i], eocd[i + 1]]) as usize;
-    let entries = u16_at(10);
-    if eocd.len() != 22 + u16_at(20)
-        || u16_at(4) != 0
-        || u16_at(6) != 0
-        || u16_at(8) != entries
-        || !(3..=256).contains(&entries)
-    {
-        return Err(invalid_docx());
-    }
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| invalid_docx())?;
+    let (entries, directory) = word_footer(bytes)?;
+    // Fixed offset prevents the parser treating an embedded archive as prepended ZIP.
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive =
+        zip::ZipArchive::with_config(config, Cursor::new(bytes)).map_err(|_| invalid_docx())?;
     // zip indexes names uniquely; a reduced count exposes duplicate directory names.
-    if archive.len() != entries || archive.offset() != 0 {
+    if archive.len() != entries
+        || archive.offset() != 0
+        || archive.central_directory_start() != directory as u64
+    {
         return Err(invalid_docx());
     }
     let mut found = [false; 3];
@@ -128,6 +107,71 @@ fn validate_word_package(bytes: &[u8]) -> Result<(), CliError> {
     } else {
         Err(invalid_docx())
     }
+}
+
+// zip 8.6 has no entry-allocation limit and may retry older EOCD records.
+// Bound every footer it can use at Known(0), not byte patterns inside members.
+fn word_footer(bytes: &[u8]) -> Result<(usize, usize), CliError> {
+    let mut root = None;
+    for (position, magic) in bytes.windows(4).enumerate() {
+        if magic != b"PK\x05\x06" {
+            continue;
+        }
+        let Some(header) = bytes.get(position..position + 22) else {
+            continue;
+        };
+        let u16_at = |i| u16::from_le_bytes([header[i], header[i + 1]]) as usize;
+        let u32_at = |i| {
+            u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]) as usize
+        };
+        let end = position + 22 + u16_at(20);
+        if end > bytes.len() {
+            continue;
+        }
+        let (on_disk, entries, size, directory) = (u16_at(8), u16_at(10), u32_at(12), u32_at(16));
+        if entries == u16::MAX as usize
+            || size == u32::MAX as usize
+            || directory == u32::MAX as usize
+        {
+            // ZIP64 is considered only for sentinel EOCD fields and an adjacent
+            // locator whose fixed-offset target actually contains an EOCD64.
+            if let Some(locator) = position
+                .checked_sub(20)
+                .and_then(|i| bytes.get(i..position))
+            {
+                if locator.starts_with(b"PK\x06\x07") {
+                    let offset =
+                        u64::from_le_bytes(locator[8..16].try_into().map_err(|_| invalid_docx())?);
+                    if let Ok(offset) = usize::try_from(offset) {
+                        if offset < position - 20
+                            && bytes.get(offset..offset.saturating_add(4)) == Some(b"PK\x06\x06")
+                        {
+                            return Err(invalid_docx());
+                        }
+                    }
+                }
+            }
+        }
+        let fixed_directory = directory < position
+            && bytes.get(directory..directory.saturating_add(4)) == Some(b"PK\x01\x02");
+        // The parser accepts zero-total EOCD before checking its directory offset.
+        if (fixed_directory || entries == 0) && on_disk > 256 {
+            return Err(invalid_docx());
+        }
+        if end == bytes.len() && fixed_directory {
+            if root.is_some()
+                || u16_at(4) != 0
+                || u16_at(6) != 0
+                || on_disk != entries
+                || !(3..=256).contains(&entries)
+                || directory.checked_add(size) != Some(position)
+            {
+                return Err(invalid_docx());
+            }
+            root = Some((entries, directory));
+        }
+    }
+    root.ok_or_else(invalid_docx)
 }
 
 impl Document {
