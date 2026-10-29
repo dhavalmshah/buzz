@@ -1,6 +1,7 @@
 pub mod agent_management;
 mod client;
 mod commands;
+mod documents;
 mod error;
 mod help_tree;
 mod links;
@@ -478,6 +479,9 @@ pub enum MessagesCmd {
         /// Also publish to the Nostr network
         #[arg(long, default_value_t = false)]
         broadcast: bool,
+        /// Preserve supplied content exactly, without appending attachment Markdown
+        #[arg(long, default_value_t = false)]
+        exact_content: bool,
         /// Attach file(s) — uploads and includes as imeta tags
         #[arg(long = "file")]
         files: Vec<String>,

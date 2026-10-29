@@ -1221,12 +1221,15 @@ impl BuzzClient {
             .map(|t| t.mime_type().to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
+        let document = crate::documents::classify(file_path, &bytes, &mime)?;
+        if document.is_none() && !ALLOWED_MIMES.contains(&mime.as_str()) {
             return Err(CliError::Usage(format!("unsupported file type: {mime}")));
         }
 
         // 3. Size check
-        let max = if mime.starts_with("video/") {
+        let max = if document.is_some() {
+            crate::documents::MAX_DOCUMENT_BYTES
+        } else if mime.starts_with("video/") {
             MAX_VIDEO_BYTES
         } else {
             MAX_IMAGE_BYTES
@@ -1291,11 +1294,17 @@ impl BuzzClient {
         // (404 or 405), fall back to the legacy /media/upload endpoint.  The 404/405 switch
         // itself is not retried; only transient failures on the selected legacy endpoint are.
         match result {
-            Ok(desc) => return Ok(desc),
+            Ok(desc) => {
+                if let Some(document) = document {
+                    document.validate_descriptor(&desc, &sha256, upload_body.len())?;
+                }
+                return Ok(desc);
+            }
             Err(CliError::Relay { status: s, body: _ })
-                if should_retry_legacy_upload(
-                    reqwest::StatusCode::from_u16(s).unwrap_or(reqwest::StatusCode::NOT_FOUND),
-                ) =>
+                if document.is_none()
+                    && should_retry_legacy_upload(
+                        reqwest::StatusCode::from_u16(s).unwrap_or(reqwest::StatusCode::NOT_FOUND),
+                    ) =>
             {
                 // Fall through to legacy endpoint below.
             }
