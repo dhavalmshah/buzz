@@ -1127,6 +1127,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]

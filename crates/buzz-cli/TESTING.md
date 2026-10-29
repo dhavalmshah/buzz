@@ -625,3 +625,29 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 60 | `notes ls` | ☐ | Own, --author all, --tag, --limit |
 | 61 | `notes rm` | ☐ | Delete→get 404, double-delete idempotent, missing slug → NotFound |
 | 62 | `users set-status` | ☐ | Text+emoji, text only, emoji-only (`--text ""`), `--clear`, `--clear` + `--text` → exit 1 |
+
+## Document carrier regression checks
+
+`cargo test -p buzz-cli` includes `tests/document_carrier.rs`. Its HTTP fixture
+listens only on `127.0.0.1`, creates synthetic signing/owner-attestation keys,
+and checks unchanged TXT/PDF/DOCX request bodies, Blossom signatures and body
+hashes, signed message content and ordered imeta. It also exercises the compiled
+`buzz messages send --content - --exact-content --file ...` command with cleared
+environment and literal stdin, document limits/refusals, descriptor mismatch,
+no document legacy fallback, and retained image/video Markdown behavior.
+
+For human testing, use a disposable local relay supporting document `/upload`:
+
+```bash
+printf 'envelope\n\n' | buzz messages send --channel <UUID> --content - \
+  --exact-content --file original.txt --file original.pdf --file original.docx
+```
+
+Verify the signed event content is exactly `envelope` followed by two newlines,
+all three originals have matching SHA/size imeta, and the downloaded bytes match
+the inputs. Repeat without `--exact-content`: document download links should be
+appended. Documents are limited to 10 MiB; DOCX recognition is a bounded package
+check, not sanitization or extraction. TXT travels as `application/octet-stream`
+when the relay's magic-byte detector has no text type. Existing media behavior
+and limits are unchanged. Keep the PR draft until the repository's separate
+human-testing requirement is explicitly confirmed.

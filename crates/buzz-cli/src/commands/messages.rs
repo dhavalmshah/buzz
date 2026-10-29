@@ -572,6 +572,7 @@ pub struct SendMessageParams {
     pub reply_to: Option<String>,
     pub broadcast: bool,
     pub files: Vec<String>,
+    pub exact_content: bool,
     pub mentions: Vec<String>,
 }
 
@@ -623,10 +624,15 @@ pub async fn cmd_send_message(
             .await
             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
         media_tags.push(crate::client::build_imeta_tag(&desc));
+        if p.exact_content {
+            continue;
+        }
         if desc.mime_type.starts_with("video/") {
             media_content.push_str("\n![video](");
-        } else {
+        } else if desc.mime_type.starts_with("image/") {
             media_content.push_str("\n![image](");
+        } else {
+            media_content.push_str("\n[file](");
         }
         media_content.push_str(&desc.url);
         media_content.push(')');
@@ -636,6 +642,8 @@ pub async fn cmd_send_message(
     } else {
         format!("{}{media_content}", p.content)
     };
+
+    validate_content_size(&final_content)?;
 
     // Build thread ref if replying. `--reply-to` is the immediate parent; the
     // thread root is derived from the parent's NIP-10 tags via the relay.
@@ -911,6 +919,7 @@ pub async fn dispatch(
             reply_to,
             broadcast,
             files,
+            exact_content,
             mentions,
         } => {
             cmd_send_message(
@@ -922,6 +931,7 @@ pub async fn dispatch(
                     reply_to,
                     broadcast,
                     files,
+                    exact_content,
                     mentions,
                 },
             )
@@ -1656,6 +1666,7 @@ mod tests {
             reply_to: None,
             broadcast: false,
             files: vec![],
+            exact_content: false,
             mentions: vec![],
         }
     }
